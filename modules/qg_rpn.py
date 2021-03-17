@@ -1,9 +1,11 @@
 import mmcv
-from mmdet.core import bbox_mapping, tensor2imgs, auto_fp16
+from mmcv.image import tensor2imgs
+from mmcv.runner import auto_fp16
+from mmdet.core import bbox_mapping
 from mmdet.models import builder
-from mmdet.models.registry import DETECTORS
+from mmdet.models.builder import DETECTORS
 from mmdet.models.detectors.base import BaseDetector
-from mmdet.models.detectors.test_mixins import RPNTestMixin
+from mmdet.models.dense_heads.rpn_test_mixin import RPNTestMixin
 
 from .modulators import RPN_Modulator
 

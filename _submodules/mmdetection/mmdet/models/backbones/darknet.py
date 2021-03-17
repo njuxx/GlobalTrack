@@ -1,138 +1,199 @@
-import os
+# Copyright (c) 2019 Western Digital Corporation or its affiliates.
+
+import logging
+
 import torch.nn as nn
+from mmcv.cnn import ConvModule, constant_init, kaiming_init
+from mmcv.runner import load_checkpoint
+from torch.nn.modules.batchnorm import _BatchNorm
 
-from mmcv.cnn import constant_init, kaiming_init
-from collections import OrderedDict
-from mmdet.models.utils import build_norm_layer
-
-from mmdet.models.registry import BACKBONES
-
-
-def common_conv2d(inplanes,
-                  planes,
-                  kernel,
-                  padding,
-                  stride,
-                  norm_cfg=dict(type='BN')):
-    cell = OrderedDict()
-    cell['conv'] = nn.Conv2d(inplanes, planes, kernel_size=kernel,
-                             stride=stride, padding=padding, bias=False)
-    if norm_cfg:
-        norm_name, norm = build_norm_layer(norm_cfg, planes)
-        cell[norm_name] = norm
-
-    cell['leakyrelu'] = nn.LeakyReLU(0.1)
-    cell = nn.Sequential(cell)
-    return cell
+from ..builder import BACKBONES
 
 
-class DarknetBasicBlockV3(nn.Module):
-    """Darknet Basic Block. Which is a 1x1 reduce conv followed by 3x3 conv."""
+class ResBlock(nn.Module):
+    """The basic residual block used in Darknet. Each ResBlock consists of two
+    ConvModules and the input is added to the final output. Each ConvModule is
+    composed of Conv, BN, and LeakyReLU. In YoloV3 paper, the first convLayer
+    has half of the number of the filters as much as the second convLayer. The
+    first convLayer has filter size of 1x1 and the second one has the filter
+    size of 3x3.
+
+    Args:
+        in_channels (int): The input channels. Must be even.
+        conv_cfg (dict): Config dict for convolution layer. Default: None.
+        norm_cfg (dict): Dictionary to construct and config norm layer.
+            Default: dict(type='BN', requires_grad=True)
+        act_cfg (dict): Config dict for activation layer.
+            Default: dict(type='LeakyReLU', negative_slope=0.1).
+    """
 
     def __init__(self,
-                 inplanes,
-                 planes,
-                 norm_cfg=dict(type='BN')):
-        super(DarknetBasicBlockV3, self).__init__()
-        self.body = nn.Sequential(
-            common_conv2d(inplanes, planes, 1, 0, 1, norm_cfg=norm_cfg),
-            common_conv2d(planes, planes * 2, 3, 1, 1, norm_cfg=norm_cfg)
-        )
+                 in_channels,
+                 conv_cfg=None,
+                 norm_cfg=dict(type='BN', requires_grad=True),
+                 act_cfg=dict(type='LeakyReLU', negative_slope=0.1)):
+        super(ResBlock, self).__init__()
+        assert in_channels % 2 == 0  # ensure the in_channels is even
+        half_in_channels = in_channels // 2
+
+        # shortcut
+        cfg = dict(conv_cfg=conv_cfg, norm_cfg=norm_cfg, act_cfg=act_cfg)
+
+        self.conv1 = ConvModule(in_channels, half_in_channels, 1, **cfg)
+        self.conv2 = ConvModule(
+            half_in_channels, in_channels, 3, padding=1, **cfg)
 
     def forward(self, x):
         residual = x
-        x = self.body(x)
-        return x + residual
+        out = self.conv1(x)
+        out = self.conv2(out)
+        out = out + residual
+
+        return out
 
 
-@BACKBONES.register_module
-class DarknetV3(nn.Module):
+@BACKBONES.register_module()
+class Darknet(nn.Module):
+    """Darknet backbone.
+
+    Args:
+        depth (int): Depth of Darknet. Currently only support 53.
+        out_indices (Sequence[int]): Output from which stages.
+        frozen_stages (int): Stages to be frozen (stop grad and set eval mode).
+            -1 means not freezing any parameters. Default: -1.
+        conv_cfg (dict): Config dict for convolution layer. Default: None.
+        norm_cfg (dict): Dictionary to construct and config norm layer.
+            Default: dict(type='BN', requires_grad=True)
+        act_cfg (dict): Config dict for activation layer.
+            Default: dict(type='LeakyReLU', negative_slope=0.1).
+        norm_eval (bool): Whether to set norm layers to eval mode, namely,
+            freeze running stats (mean and var). Note: Effect on Batch Norm
+            and its variants only.
+
+    Example:
+        >>> from mmdet.models import Darknet
+        >>> import torch
+        >>> self = Darknet(depth=53)
+        >>> self.eval()
+        >>> inputs = torch.rand(1, 3, 416, 416)
+        >>> level_outputs = self.forward(inputs)
+        >>> for level_out in level_outputs:
+        ...     print(tuple(level_out.shape))
+        ...
+        (1, 256, 52, 52)
+        (1, 512, 26, 26)
+        (1, 1024, 13, 13)
+    """
+
+    # Dict(depth: (layers, channels))
+    arch_settings = {
+        53: ((1, 2, 8, 8, 4), ((32, 64), (64, 128), (128, 256), (256, 512),
+                               (512, 1024)))
+    }
 
     def __init__(self,
-                 layers=[1, 2, 8, 8, 4],
-                 inplanes=[3, 32, 64, 128, 256, 512],
-                 planes=[32, 64, 128, 256, 512, 1024],
-                 num_stages=5,
-                 classes=1000,
-                 norm_cfg=dict(type='BN'),
-                 out_indices=None,
+                 depth=53,
+                 out_indices=(3, 4, 5),
                  frozen_stages=-1,
+                 conv_cfg=None,
+                 norm_cfg=dict(type='BN', requires_grad=True),
+                 act_cfg=dict(type='LeakyReLU', negative_slope=0.1),
                  norm_eval=True):
-        super(DarknetV3, self).__init__()
-        assert len(layers) == len(planes) - 1, (
-            "len(planes) should equal to len(layers) + 1, given {} vs {}".format(
-                len(planes), len(layers)))
-        self.num_stages = num_stages
-        assert 5 >= num_stages >= 1
-        assert max(out_indices) < num_stages
+        super(Darknet, self).__init__()
+        if depth not in self.arch_settings:
+            raise KeyError(f'invalid depth {depth} for darknet')
+        self.depth = depth
         self.out_indices = out_indices
         self.frozen_stages = frozen_stages
+        self.layers, self.channels = self.arch_settings[depth]
+
+        cfg = dict(conv_cfg=conv_cfg, norm_cfg=norm_cfg, act_cfg=act_cfg)
+
+        self.conv1 = ConvModule(3, 32, 3, padding=1, **cfg)
+
+        self.cr_blocks = ['conv1']
+        for i, n_layers in enumerate(self.layers):
+            layer_name = f'conv_res_block{i + 1}'
+            in_c, out_c = self.channels[i]
+            self.add_module(
+                layer_name,
+                self.make_conv_res_block(in_c, out_c, n_layers, **cfg))
+            self.cr_blocks.append(layer_name)
+
         self.norm_eval = norm_eval
-        self.darknet_layer_name = []
 
-        self.stem = common_conv2d(inplanes[0], planes[0], 3, 1, 1, norm_cfg=norm_cfg)
+    def forward(self, x):
+        outs = []
+        for i, layer_name in enumerate(self.cr_blocks):
+            cr_block = getattr(self, layer_name)
+            x = cr_block(x)
+            if i in self.out_indices:
+                outs.append(x)
 
-        for i, (nlayer, inchannel, channel) in enumerate(zip(layers[:self.num_stages],
-                                                             inplanes[1:self.num_stages + 1],
-                                                             planes[1:self.num_stages + 1])):
-            assert channel % 2 == 0, "channel {} cannot be divided by 2".format(channel)
-            # add downsample conv with stride=2
-            layer = []
-            layer_name = 'layer{}'.format(i + 1)
-            self.darknet_layer_name.append(layer_name)
-
-            layer.append(common_conv2d(inchannel, channel, 3, 1, 2, norm_cfg=norm_cfg))
-
-            for _ in range(nlayer):
-                layer.append(DarknetBasicBlockV3(channel, channel // 2))
-            self.add_module(layer_name, nn.Sequential(*layer))
-
-        if not self.out_indices:
-            self.avg_gap = nn.AvgPool2d(7)
-            self.output = nn.Linear(1024, classes)
-
-        self._freeze_stages()
+        return tuple(outs)
 
     def init_weights(self, pretrained=None):
         if isinstance(pretrained, str):
-            import torch
-            assert os.path.isfile(pretrained), "file {} not found.".format(pretrained)
-            self.load_state_dict(torch.load(pretrained), strict=False)
+            logger = logging.getLogger()
+            load_checkpoint(self, pretrained, strict=False, logger=logger)
         elif pretrained is None:
             for m in self.modules():
                 if isinstance(m, nn.Conv2d):
                     kaiming_init(m)
-                elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                elif isinstance(m, (_BatchNorm, nn.GroupNorm)):
                     constant_init(m, 1)
+
         else:
             raise TypeError('pretrained must be a str or None')
 
     def _freeze_stages(self):
         if self.frozen_stages >= 0:
-            for param in self.stem.parameters():
-                param.requires_grad = False
-
-        for i in range(1, self.frozen_stages + 1):
-            m = getattr(self, 'layer{}'.format(i))
-            for param in m.parameters():
-                param.requires_grad = False
-
-    def forward(self, x):
-        x = self.stem(x)
-        outs = []
-        for i, layer_name in enumerate(self.darknet_layer_name):
-            darknet_layer = getattr(self, layer_name)
-            x = darknet_layer(x)
-            if self.out_indices and i in self.out_indices:
-                outs.append(x)
-        if not self.out_indices:
-            x = self.avg_gap(x).view(x.size(0), -1)
-            outs = self.output(x)
-        return outs
+            for i in range(self.frozen_stages):
+                m = getattr(self, self.cr_blocks[i])
+                m.eval()
+                for param in m.parameters():
+                    param.requires_grad = False
 
     def train(self, mode=True):
-        super(DarknetV3, self).train(mode)
+        super(Darknet, self).train(mode)
+        self._freeze_stages()
         if mode and self.norm_eval:
             for m in self.modules():
-                if isinstance(m, nn.BatchNorm2d):
+                if isinstance(m, _BatchNorm):
                     m.eval()
+
+    @staticmethod
+    def make_conv_res_block(in_channels,
+                            out_channels,
+                            res_repeat,
+                            conv_cfg=None,
+                            norm_cfg=dict(type='BN', requires_grad=True),
+                            act_cfg=dict(type='LeakyReLU',
+                                         negative_slope=0.1)):
+        """In Darknet backbone, ConvLayer is usually followed by ResBlock. This
+        function will make that. The Conv layers always have 3x3 filters with
+        stride=2. The number of the filters in Conv layer is the same as the
+        out channels of the ResBlock.
+
+        Args:
+            in_channels (int): The number of input channels.
+            out_channels (int): The number of output channels.
+            res_repeat (int): The number of ResBlocks.
+            conv_cfg (dict): Config dict for convolution layer. Default: None.
+            norm_cfg (dict): Dictionary to construct and config norm layer.
+                Default: dict(type='BN', requires_grad=True)
+            act_cfg (dict): Config dict for activation layer.
+                Default: dict(type='LeakyReLU', negative_slope=0.1).
+        """
+
+        cfg = dict(conv_cfg=conv_cfg, norm_cfg=norm_cfg, act_cfg=act_cfg)
+
+        model = nn.Sequential()
+        model.add_module(
+            'conv',
+            ConvModule(
+                in_channels, out_channels, 3, stride=2, padding=1, **cfg))
+        for idx in range(res_repeat):
+            model.add_module('res{}'.format(idx),
+                             ResBlock(out_channels, **cfg))
+        return model

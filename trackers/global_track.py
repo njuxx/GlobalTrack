@@ -5,7 +5,7 @@ from neuron.models import Tracker
 from mmcv import Config
 from mmcv.runner import load_checkpoint
 from mmdet.models import build_detector
-from mmdet.core import wrap_fp16_model
+from mmcv.runner import wrap_fp16_model
 
 
 __all__ = ['GlobalTrack']
@@ -25,12 +25,12 @@ class GlobalTrack(Tracker):
         cfg = Config.fromfile(cfg_file)
         if cfg.get('cudnn_benchmark', False):
             torch.backends.cudnn.benchmark = True
-        cfg.model.pretrained = None
+        cfg.model[0].pretrained = None
         self.cfg = cfg
 
         # build model
         model = build_detector(
-            cfg.model, train_cfg=None, test_cfg=cfg.test_cfg)
+            cfg.model[0], train_cfg=None, test_cfg=cfg.test_cfg)
         fp16_cfg = cfg.get('fp16', None)
         if fp16_cfg is not None:
             wrap_fp16_model(model)
@@ -57,7 +57,7 @@ class GlobalTrack(Tracker):
         bboxes = bboxes.to(self.device, non_blocking=True)
 
         # initialize the modulator
-        self.model._process_query(img, [bboxes])
+        self.model._process_query(img, [bboxes]) #
     
     @torch.no_grad()
     def update(self, img, **kwargs):
@@ -72,7 +72,7 @@ class GlobalTrack(Tracker):
 
         # get detections
         results = self.model._process_gallary(
-            img, [img_meta], rescale=True, **kwargs)
+            img, [img_meta], rescale=True, **kwargs) #
         
         if not kwargs.get('return_all', False):
             # return the top-1 detection

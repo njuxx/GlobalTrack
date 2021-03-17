@@ -1,6 +1,6 @@
 import torch.nn as nn
 
-from mmdet.models.roi_extractors import SingleRoIExtractor
+from mmdet.models.roi_heads.roi_extractors import SingleRoIExtractor
 from mmdet.core import bbox2roi
 from mmcv.cnn import normal_init
 

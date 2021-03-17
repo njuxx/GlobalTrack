@@ -4,10 +4,12 @@ import pycocotools.mask as maskUtils
 import torch
 import torch.nn as nn
 
-from mmdet.models.registry import DETECTORS
+from mmdet.models.builder import DETECTORS
+from mmcv.image import tensor2imgs
+from mmcv.runner import auto_fp16
 from mmdet.models.detectors.two_stage import TwoStageDetector
-from mmdet.core import auto_fp16, get_classes, tensor2imgs, \
-    bbox2result, bbox2roi, build_assigner, build_sampler
+from mmdet.models.dense_heads.rpn_test_mixin import RPNTestMixin
+from mmdet.core import get_classes, bbox2result, bbox2roi, build_assigner, build_sampler
 
 from .modulators import RPN_Modulator, RCNN_Modulator
 
@@ -21,20 +23,22 @@ class QG_RCNN(TwoStageDetector):
     def __init__(self,
                  backbone,
                  rpn_head,
-                 bbox_roi_extractor,
-                 bbox_head,
+                 roi_head,
+                #  bbox_roi_extractor,
+                #  bbox_head,
                  train_cfg,
                  test_cfg,
                  neck=None,
-                 shared_head=None,
+                #  shared_head=None,
                  pretrained=None):
         super(QG_RCNN, self).__init__(
             backbone=backbone,
             neck=neck,
-            shared_head=shared_head,
+            # shared_head=shared_head,
             rpn_head=rpn_head,
-            bbox_roi_extractor=bbox_roi_extractor,
-            bbox_head=bbox_head,
+            roi_head=roi_head,
+            # bbox_roi_extractor=bbox_roi_extractor,
+            # bbox_head=bbox_head,
             train_cfg=train_cfg,
             test_cfg=test_cfg,
             pretrained=pretrained)
@@ -131,29 +135,30 @@ class QG_RCNN(TwoStageDetector):
             gt_bboxes_z_ij = gt_bboxes_z[i:i + 1]
             gt_bboxes_z_ij[0] = gt_bboxes_z_ij[0][j:j + 1]
             rois_z = bbox2roi(gt_bboxes_z_ij)
-            bbox_feats_z = self.bbox_roi_extractor(
-                z_ij[:self.bbox_roi_extractor.num_inputs], rois_z)
+            bbox_feats_z = self.roi_head.bbox_roi_extractor(
+                z_ij[:self.roi_head.bbox_roi_extractor.num_inputs], rois_z)
             
             # bbox head forward of gallary
             x_ij = [u[i:i + 1] for u in x]
             rois_x = bbox2roi([res.bboxes for res in sampling_results])
-            bbox_feats_x = self.bbox_roi_extractor(
-                x_ij[:self.bbox_roi_extractor.num_inputs], rois_x)
+            bbox_feats_x = self.roi_head.bbox_roi_extractor(
+                x_ij[:self.roi_head.bbox_roi_extractor.num_inputs], rois_x)
             
             # do modulation
             bbox_feats = self.rcnn_modulator(
                 bbox_feats_z, bbox_feats_x)
             if self.with_shared_head:
+                raise NotImplementedError
                 bbox_feats = self.shared_head(bbox_feats)
-            cls_score, bbox_pred = self.bbox_head(bbox_feats)
+            cls_score, bbox_pred = self.roi_head.bbox_head(bbox_feats)
 
             # calculate bbox losses
-            bbox_targets = self.bbox_head.get_target(
+            bbox_targets = self.roi_head.bbox_head.get_target(
                 sampling_results,
                 gt_bboxes_ij,
                 gt_labels_ij,
                 self.train_cfg.rcnn)
-            loss_bbox = self.bbox_head.loss(
+            loss_bbox = self.roi_head.bbox_head.loss(
                 cls_score, bbox_pred, *bbox_targets)
             losses_ij.update(loss_bbox)
 
@@ -205,8 +210,8 @@ class QG_RCNN(TwoStageDetector):
         
         # RPN forward
         rpn_feats = next(self.rpn_modulator(z, x, gt_bboxes_z))[0]
-        proposal_list = self.simple_test_rpn(
-            rpn_feats, img_meta_x, self.test_cfg.rpn)
+        proposal_list = self.rpn_head.simple_test_rpn(
+            rpn_feats, img_meta_x)#, self.test_cfg.rpn)
         
         # RCNN forward
         det_bboxes, det_labels = self.simple_test_bboxes(
@@ -233,26 +238,27 @@ class QG_RCNN(TwoStageDetector):
                            **kwargs):
         # bbox head forward of query
         rois_z = bbox2roi(gt_bboxes_z)
-        bbox_feats_z = self.bbox_roi_extractor(
-            z[:self.bbox_roi_extractor.num_inputs], rois_z)
+        bbox_feats_z = self.roi_head.bbox_roi_extractor(
+            z[:self.roi_head.bbox_roi_extractor.num_inputs], rois_z)
         
         # bbox head forward of gallary
         rois_x = bbox2roi(proposals)
-        bbox_feats_x = self.bbox_roi_extractor(
-            x[:self.bbox_roi_extractor.num_inputs], rois_x)
+        bbox_feats_x = self.roi_head.bbox_roi_extractor(
+            x[:self.roi_head.bbox_roi_extractor.num_inputs], rois_x)
         
         # do modulation
         roi_feats = self.rcnn_modulator(bbox_feats_z, bbox_feats_x)
         if self.with_shared_head:
+            raise NotImplementedError
             roi_feats = self.shared_head(roi_feats)
-        cls_score, bbox_pred = self.bbox_head(roi_feats)
+        cls_score, bbox_pred = self.roi_head.bbox_head(roi_feats)
 
         # get predictions
         img_shape = img_meta_x[0]['img_shape']
         scale_factor = img_meta_x[0]['scale_factor']
 
         if keep_order:
-            det_bboxes, det_labels = self.bbox_head.get_det_bboxes(
+            det_bboxes, det_labels = self.roi_head.bbox_head.get_bboxes(
                 rois_x,
                 cls_score,
                 bbox_pred,
@@ -263,7 +269,7 @@ class QG_RCNN(TwoStageDetector):
             det_bboxes = det_bboxes[:, 4:]
             det_labels = det_labels[:, 1]
         else:
-            det_bboxes, det_labels = self.bbox_head.get_det_bboxes(
+            det_bboxes, det_labels = self.roi_head.bbox_head.get_bboxes(
                 rois_x,
                 cls_score,
                 bbox_pred,
@@ -292,8 +298,8 @@ class QG_RCNN(TwoStageDetector):
         # RPN forward
         rpn_feats = next(self.rpn_modulator(
             self._query, x, self._gt_bboxes_z))[0]
-        proposal_list = self.simple_test_rpn(
-            rpn_feats, img_meta_x, self.test_cfg.rpn)
+        proposal_list = self.rpn_head.simple_test_rpn(
+            rpn_feats, img_meta_x) #, self.test_cfg.rpn)
         
         # RCNN forward
         det_bboxes, det_labels = self.simple_test_bboxes(
@@ -301,7 +307,7 @@ class QG_RCNN(TwoStageDetector):
             proposal_list, self.test_cfg.rcnn, **kwargs)
         if not kwargs.get('keep_order', False):
             bbox_results = bbox2result(
-                det_bboxes, det_labels, self.bbox_head.num_classes)
+                det_bboxes, det_labels, self.roi_head.bbox_head.num_classes)
         else:
             bbox_results = [np.concatenate([
                 det_bboxes.cpu().numpy(),

@@ -1,9 +1,9 @@
 import numpy as np
-
+import os.path as osp
 import neuron.data as data
 import neuron.ops as ops
 from mmcv.parallel import DataContainer as DC
-from mmdet.datasets.registry import DATASETS
+from mmdet.datasets import DATASETS
 
 
 __all__ = ['PairWrapper']
@@ -11,20 +11,23 @@ __all__ = ['PairWrapper']
 
 def _datasets(name):
     assert isinstance(name, str)
+    root_dir = "/disk/xuxiang/GlobalTrack/data"
     if name == 'coco_train':
-        return data.COCODetection(subset='train')
+        return data.COCODetection(subset='train', root_dir=osp.join(root_dir,"coco"))
     elif name == 'coco_val':
-        return data.COCODetection(subset='val')
+        return data.COCODetection(subset='val', root_dir=osp.join(root_dir,"coco"))
     elif name == 'got10k_train':
-        return data.GOT10k(subset='train')
+        return data.GOT10k(subset='train', root_dir=osp.join(root_dir,"GOT-10k"))
     elif name == 'got10k_val':
-        return data.GOT10k(subset='val')
+        return data.GOT10k(subset='val', root_dir=osp.join(root_dir,"GOT-10k"))
     elif name == 'lasot_train':
-        return data.LaSOT(subset='train')
+        return data.LaSOT(subset='train', root_dir=osp.join(root_dir,"LaSOTBenchmark"))
     elif name == 'imagenet_vid':
+        raise NotImplementedError
         return data.ImageNetVID(subset=['train', 'val'])
     elif name == 'visdrone_vid':
-       return  data.VisDroneVID(subset=['train', 'val'])
+        raise NotImplementedError
+        return  data.VisDroneVID(subset=['train', 'val'])
     else:
         raise KeyError('Unknown dataset:', name)
 
